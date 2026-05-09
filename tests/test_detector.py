@@ -6,7 +6,6 @@ Unit tests for the AnomalyDetector.
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.anomaly.detector import AnomalyDetector
 

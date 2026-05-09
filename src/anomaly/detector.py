@@ -1,56 +1,67 @@
 """
-test_parser.py
---------------
-Unit tests for the LogParser.
+detector.py
+-----------
+Anomaly detection engine for MAVLink telemetry data.
 """
 
-import pytest
 import pandas as pd
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+import numpy as np
+from loguru import logger
 
-from src.parser.log_parser import LogParser
+MONITORED_CHANNELS = [
+    "altitude", "roll", "pitch", "yaw",
+    "battery_voltage", "airspeed", "groundspeed", "climb_rate",
+]
 
+class AnomalyDetector:
+    def __init__(self, zscore_threshold: float = 3.0, rolling_window: int = 20):
+        self.zscore_threshold = zscore_threshold
+        self.rolling_window = rolling_window
 
-class TestLogParser:
+    def detect(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        all_anomalies = []
+        for channel in MONITORED_CHANNELS:
+            if channel not in df.columns:
+                continue
+            series = df[channel].dropna()
+            if len(series) < self.rolling_window:
+                continue
+            zscore_anom = self._zscore_detection(df, channel)
+            if not zscore_anom.empty:
+                all_anomalies.append(zscore_anom)
+            rolling_anom = self._rolling_detection(df, channel)
+            if not rolling_anom.empty:
+                all_anomalies.append(rolling_anom)
+        if not all_anomalies:
+            return pd.DataFrame()
+        combined = pd.concat(all_anomalies, ignore_index=True)
+        combined = combined.drop_duplicates(subset=["timestamp", "channel"])
+        return combined.sort_values("timestamp").reset_index(drop=True)
 
-    def test_parse_nonexistent_file_returns_empty(self):
-        parser = LogParser()
-        result = parser.parse_file(Path("nonexistent_file.tlog"))
-        assert isinstance(result, pd.DataFrame)
-        assert result.empty
+    def _zscore_detection(self, df, channel):
+        series = df[channel].dropna()
+        mean, std = series.mean(), series.std()
+        if std == 0:
+            return pd.DataFrame()
+        zscores = (df[channel] - mean) / std
+        mask = zscores.abs() > self.zscore_threshold
+        anomalies = df[mask].copy()
+        anomalies["channel"] = channel
+        anomalies["method"] = "z-score"
+        anomalies["score"] = zscores[mask].abs().round(3)
+        return anomalies[["timestamp", "channel", channel, "method", "score"]]
 
-    def test_unsupported_format_returns_empty(self, tmp_path):
-        dummy = tmp_path / "test.csv"
-        dummy.write_text("col1,col2\n1,2\n")
-        parser = LogParser()
-        result = parser.parse_file(dummy)
-        assert result.empty
-
-    def test_build_dataframe_from_records(self):
-        parser = LogParser()
-        records = [
-            {"msg_type": "GLOBAL_POSITION_INT", "timestamp": 1.0, "lat": 37.77, "lon": -122.41, "altitude": 10.0},
-            {"msg_type": "ATTITUDE", "timestamp": 1.1, "roll": 0.5, "pitch": -0.2, "yaw": 90.0},
-            {"msg_type": "SYS_STATUS", "timestamp": 1.2, "battery_voltage": 12.4, "battery_remaining": 85},
-        ]
-        df = parser._build_dataframe(records)
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) == 3
-        assert "timestamp" in df.columns
-
-    def test_build_dataframe_empty_records(self):
-        parser = LogParser()
-        df = parser._build_dataframe([])
-        assert df.empty
-
-    def test_dataframe_sorted_by_timestamp(self):
-        parser = LogParser()
-        records = [
-            {"msg_type": "ATTITUDE", "timestamp": 3.0, "roll": 1.0},
-            {"msg_type": "ATTITUDE", "timestamp": 1.0, "roll": 2.0},
-            {"msg_type": "ATTITUDE", "timestamp": 2.0, "roll": 3.0},
-        ]
-        df = parser._build_dataframe(records)
-        timestamps = df["timestamp"].tolist()
-        assert timestamps == sorted(timestamps)
+    def _rolling_detection(self, df, channel):
+        series = df[channel]
+        rolling_mean = series.rolling(window=self.rolling_window, center=True).mean()
+        rolling_std = series.rolling(window=self.rolling_window, center=True).std()
+        deviation = (series - rolling_mean).abs()
+        threshold = self.zscore_threshold * rolling_std
+        mask = (deviation > threshold).fillna(False)
+        anomalies = df[mask].copy()
+        anomalies["channel"] = channel
+        anomalies["method"] = "rolling-stats"
+        anomalies["score"] = (deviation[mask] / rolling_std[mask]).round(3)
+        return anomalies[["timestamp", "channel", channel, "method", "score"]]
